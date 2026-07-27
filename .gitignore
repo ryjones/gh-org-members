@@ -1,0 +1,5 @@
+/target
+.DS_Store
+
+# Captured API output from real runs; kept locally, not tracked.
+/results
