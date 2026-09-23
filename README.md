@@ -8,7 +8,9 @@ Works against github.com and GitHub Enterprise Server.
 
 Ships two binaries: `gh-org-members` fetches the export, and `gh-org-reports`
 reads one back and reports the people who fall through the gaps in it — org
-members on no team, and enterprise members in no org.
+members on no team, and enterprise members in no org. `gh-org-members
+--check-logins` also checks a file of hand-written logins against the casing
+GitHub itself uses.
 
 ## Build
 
@@ -50,6 +52,8 @@ With no `-o`, the YAML goes to stdout and progress goes to stderr, so
 | `--include-child-team-members` | Count members inherited from child teams as parent-team members |
 | `--no-teams` | Org membership only; skip teams entirely |
 | `--include-email` | Include each person's publicly visible email |
+| `--check-logins <FILE>` | Check the logins in a file instead of exporting people (see below) |
+| `--login-key <KEY>` | YAML key holding logins in that file; repeatable, replaces the default set |
 
 The token is read from `GITHUB_TOKEN`, falling back to `GH_TOKEN`.
 
@@ -111,6 +115,119 @@ read.
 If teams could not be read for some organization — a token without `read:org`
 there — that org is listed under `organizations_without_team_data` and its
 people appear with no team membership, rather than silently looking team-less.
+
+## Checking logins
+
+GitHub treats a login as case-insensitive: `RyJones` and `ryjones` reach the
+same account, and both resolve over the API. A file that lists people by hand —
+a CLOWarden org config, a roster, a list pasted out of an email — can therefore
+carry the wrong casing forever without anything breaking and without anything
+saying so.
+
+`--check-logins` reads such a file, asks GitHub how it spells every name in it,
+and reports the ones that do not match. It queries accounts rather than orgs, so
+it needs no `--enterprise` or `--org`, and it conflicts with them: exporting
+people and checking a file are separate jobs.
+
+```sh
+gh-org-members --check-logins config.yaml
+gh-org-members --check-logins config.yaml -o case.yaml
+gh-org-members --check-logins config.yaml --login-key maintainers --login-key members
+printf 'RyJones\ndana\n' | gh-org-members --check-logins -
+```
+
+The input may be either:
+
+- **YAML**, walked for the keys that hold logins — by default `login`, `logins`,
+  `maintainer(s)`, `member(s)`, `user(s)` and `people`/`person`, as a scalar or a
+  list of scalars. `owners` and `admins` are *not* in that set: they are ordinary
+  team names, and a CLOWarden `teams: {owners: maintain}` block would otherwise
+  offer up a permission where a login was expected. `--login-key` replaces the
+  set, so `--login-key owners` asks for them. A `gh-org-members` export works as
+  input too, since `login:` is one of the keys.
+- **Plain text**, one login per line, with `#` comments, blank lines, `- `
+  markers and trailing commas tolerated. This is the fallback for anything that
+  is not a YAML mapping or sequence, which includes a bare list of logins.
+
+```yaml
+source:
+  input: config.yaml
+  api_url: https://api.github.com/graphql
+  format: yaml
+  login_keys:
+    - login
+    - maintainers
+    - members
+totals:
+  names: 41
+  occurrences: 58
+  correct: 36
+  case_mismatches: 2
+  resolved_to_another_login: 1
+  unknown: 1
+  invalid: 1
+login_case_mismatches:
+  - given: RyJones
+    actual: ryjones
+    occurrences:
+      - teams[0].maintainers[0]
+      - teams[3].members[2]
+  - given: Hyperledger
+    actual: hyperledger
+    kind: Organization
+    occurrences:
+      - teams[1].members[0]
+resolved_to_another_login:
+  - given: oldname
+    actual: newname
+    occurrences:
+      - teams[2].members[1]
+unknown:
+  - given: notauser
+    occurrences:
+      - teams[2].members[4]
+invalid:
+  - given: someone@example.com
+    occurrences:
+      - teams[2].members[5]
+```
+
+A name spelled the way GitHub spells it is counted and not listed: the report is
+what to fix. Each finding carries every place the name appeared, as a YAML path
+(`teams[0].maintainers[0]`) or a line number (`line 12`), so it can be corrected
+without searching for it.
+
+The four kinds of finding are deliberately separate:
+
+- **`login_case_mismatches`** — the same account, spelled differently. `kind`
+  appears when the account is not a `User`, because an organization in a list of
+  people is worth seeing even though casing was the question.
+- **`resolved_to_another_login`** — GitHub answered with a login that differs by
+  more than case, which is what a renamed account looks like. The new spelling is
+  a fact; whether the entry should follow it is not, so it is not called a case
+  fix.
+- **`unknown`** — no account answers to that name. A typo, a deleted account, or
+  a rename with no redirect left.
+- **`invalid`** — not the shape of a login at all (an email address, a display
+  name, a team slug with a slash). These are never looked up: no account could be
+  named that, so asking would spend quota to be told what the shape already says.
+
+Names are distinct by exact spelling, so one name written twice is a single
+finding with two occurrences, while two casings of one account are two names.
+Ordering is case-insensitive by name, as in the export.
+
+Every name is looked up — around fifty per request, one point each — and its
+outcome printed as it lands, so a long list says what it has done rather than
+going quiet:
+
+```
+[37/41] RyJones -- wrong case: GitHub spells it ryjones
+[38/41] notauser -- no such account
+```
+
+The exit status is non-zero when the check finds anything to fix, so it can gate
+a config file in CI. A run that finds nothing exits zero and writes only the
+`source` and `totals` blocks.
 
 ## Reports
 
@@ -209,6 +326,15 @@ report is unanswerable.
   organization fails. The enterprise people list is treated the same way: if it
   cannot be read, the org listings are still exported, and the export says so
   rather than implying nobody sits outside an org.
+- **Login lookups are batched and degrade gracefully.** Around fifty logins go
+  out per query as aliased `repositoryOwner` fields — `repositoryOwner` rather
+  than `user` so an organization resolves too. A login nothing answers to may
+  come back as a null field or as an error against that field, and in the second
+  case GitHub may withhold the rest of the response; when that happens the batch
+  is halved and retried, down to single logins. Only an error that names a
+  missing account is read as "no such account": anything else fails the run,
+  because passing off an unread name as absent would turn a broken check into a
+  clean-looking one.
 - **Enterprise owners are fetched separately.** They administer the enterprise
   rather than belong to it, so `enterprise.members` leaves them out. Reading
   them needs a token that owns the enterprise; without one they are skipped
@@ -222,8 +348,9 @@ cargo test
 
 Unit tests cover report assembly (ordering, cross-org merging, case-insensitive
 login identity, withheld fields), the two gap reports and what makes each of
-them unanswerable, YAML layout, and the backoff/reset arithmetic. They make no
-network calls.
+them unanswerable, the login check (which keys a YAML input gives up and which
+it does not, plain-text parsing, and how each answer from GitHub is classified),
+YAML layout, and the backoff/reset arithmetic. They make no network calls.
 
 `results/` holds YAML captured from real runs against a live enterprise, kept out
 of git and kept around so the output shape can be inspected without re-spending
