@@ -115,6 +115,16 @@ pub struct EnterpriseOwnerInfoNode {
     pub admins: MemberConnection,
 }
 
+/// One `repositoryOwner` lookup: how GitHub spells the login, and whether it
+/// belongs to a person or an organization.
+#[derive(Debug, Deserialize)]
+pub struct OwnerNode {
+    pub login: String,
+    /// `User` or `Organization`.
+    #[serde(rename = "__typename")]
+    pub typename: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OrgMembersData {
     pub organization: Option<OrgMembersNode>,

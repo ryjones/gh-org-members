@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read as _, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use serde::Serialize;
 
 use gh_org_members::client::GithubClient;
 use gh_org_members::collect::{Collector, EnterpriseMember, OrgSnapshot, TeamMembership};
+use gh_org_members::logins::{self, CaseCheck, InputFormat, Resolution};
 use gh_org_members::model::*;
 use gh_org_members::yaml;
 
@@ -61,6 +64,47 @@ struct Args {
     /// out; pagination itself is always cursor-driven.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
     batch_size: u32,
+
+    /// Check the GitHub logins in this file against the casing GitHub itself
+    /// uses, instead of exporting people. `-` reads stdin.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "enterprise",
+            "org",
+            "no_teams",
+            "include_child_team_members",
+            "include_email",
+        ]
+    )]
+    check_logins: Option<PathBuf>,
+
+    /// YAML key whose values hold logins in the checked file. Repeatable, and
+    /// replaces the default set rather than adding to it.
+    #[arg(long, value_name = "KEY", requires = "check_logins")]
+    login_key: Vec<String>,
+}
+
+/// The YAML `gh-org-members --check-logins` writes.
+#[derive(Debug, Serialize)]
+struct LoginCheckOutput {
+    source: LoginCheckSource,
+    #[serde(flatten)]
+    check: CaseCheck,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginCheckSource {
+    /// The file the names came from.
+    input: String,
+    api_url: String,
+    /// `yaml` when the file was walked for login-bearing keys, `text` when it
+    /// was read a line at a time. It decides what an `occurrences` path means.
+    format: InputFormat,
+    /// The keys that were read. Absent for a text input, which has none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    login_keys: Vec<String>,
 }
 
 /// Accumulates one person across every org and team they appear in.
@@ -92,18 +136,21 @@ struct OrgAccum {
 }
 
 #[tokio::main]
-async fn main() {
-    if let Err(err) = run().await {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<ExitCode> {
     let args = Args::parse();
 
-    if args.enterprise.is_none() && args.org.is_empty() {
-        bail!("pass --enterprise <slug> and/or --org <slug>");
+    if args.check_logins.is_none() && args.enterprise.is_none() && args.org.is_empty() {
+        bail!("pass --enterprise <slug> and/or --org <slug>, or --check-logins <file>");
     }
 
     let token = std::env::var("GITHUB_TOKEN")
@@ -136,6 +183,10 @@ async fn run() -> Result<()> {
 
     let viewer = collector.viewer_login().await?;
     eprintln!("Authenticated as {viewer} at {api_url}");
+
+    if let Some(path) = &args.check_logins {
+        return check_logins(&args, &api_url, &collector, path).await;
+    }
 
     // Resolve the org list.
     let mut orgs: Vec<String> = Vec::new();
@@ -230,7 +281,152 @@ async fn run() -> Result<()> {
     if failures > 0 {
         eprintln!("Warning: {failures} organization(s) failed; output is partial");
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read the logins in a file and report the ones GitHub spells differently.
+///
+/// Every name is looked up, and the outcome of each printed as it lands, so a
+/// long list says what it has done rather than going quiet. The exit status is
+/// non-zero when anything needs fixing, which is what makes this usable as a
+/// gate over a config file.
+async fn check_logins(
+    args: &Args,
+    api_url: &str,
+    collector: &Collector<'_>,
+    path: &Path,
+) -> Result<ExitCode> {
+    let text = read_input(path)?;
+    let input = input_name(path);
+    let keys: Vec<String> = if args.login_key.is_empty() {
+        logins::DEFAULT_LOGIN_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect()
+    } else {
+        args.login_key.clone()
+    };
+
+    let (names, format) = logins::parse_names(&text, &keys);
+    if names.is_empty() {
+        bail!("no logins found in {input}");
+    }
+
+    // A name that cannot be a login is reported without a lookup: no account
+    // could be spelled that way, so asking would spend quota to learn nothing.
+    let queryable: Vec<String> = names
+        .iter()
+        .map(|name| name.name.clone())
+        .filter(|name| logins::is_plausible_login(name))
+        .collect();
+    let skipped = names.len() - queryable.len();
+    eprintln!(
+        "Checking {} name(s) from {input} ({} format){}",
+        names.len(),
+        format.label(),
+        if skipped > 0 {
+            format!("; {skipped} cannot be a login and will not be looked up")
+        } else {
+            String::new()
+        }
+    );
+
+    let total = queryable.len();
+    let mut resolutions: BTreeMap<String, Resolution> = BTreeMap::new();
+    let mut done = 0usize;
+    for chunk in queryable.chunks(collector.login_batch_size()) {
+        for (name, resolution) in collector.resolve_logins(chunk).await? {
+            done += 1;
+            eprintln!("[{done}/{total}] {name} -- {}", outcome(&name, &resolution));
+            resolutions.insert(name, resolution);
+        }
+    }
+
+    let output = LoginCheckOutput {
+        source: LoginCheckSource {
+            input,
+            api_url: api_url.to_string(),
+            format,
+            login_keys: match format {
+                InputFormat::Yaml => keys,
+                InputFormat::Text => Vec::new(),
+            },
+        },
+        check: logins::check(&names, &resolutions),
+    };
+
+    let yaml = yaml::to_string(&output).context("failed to serialize YAML")?;
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &yaml)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            eprintln!("Wrote {}", path.display());
+        }
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(yaml.as_bytes())?;
+        }
+    }
+
+    let rate = collector.rate_state();
+    if let (Some(remaining), Some(limit)) = (rate.remaining, rate.limit) {
+        eprintln!("Rate limit: {remaining}/{limit} points remaining");
+    }
+
+    let findings = output.check.findings();
+    if findings == 0 {
+        eprintln!(
+            "All {} name(s) are spelled the way GitHub spells them",
+            output.check.totals.names
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let totals = &output.check.totals;
+    eprintln!(
+        "{findings} of {} name(s) need attention: {} wrong case, {} renamed, {} unknown, {} not a login",
+        totals.names,
+        totals.case_mismatches,
+        totals.resolved_to_another_login,
+        totals.unknown,
+        totals.invalid
+    );
+    Ok(ExitCode::FAILURE)
+}
+
+/// One line's worth of verdict on a name, for the progress output.
+fn outcome(given: &str, resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Found { login, kind } if login == given => match kind.as_deref() {
+            Some(kind) if kind != "User" => {
+                format!("ok, but that is a GitHub {}", kind.to_lowercase())
+            }
+            _ => "ok".to_string(),
+        },
+        Resolution::Found { login, .. } if login.eq_ignore_ascii_case(given) => {
+            format!("wrong case: GitHub spells it {login}")
+        }
+        Resolution::Found { login, .. } => format!("resolves to {login}"),
+        Resolution::Unknown => "no such account".to_string(),
+    }
+}
+
+fn read_input(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read stdin")?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn input_name(path: &Path) -> String {
+    if path == Path::new("-") {
+        "stdin".to_string()
+    } else {
+        path.display().to_string()
+    }
 }
 
 fn build_report(
@@ -359,6 +555,7 @@ fn person_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gh_org_members::logins::GivenName;
 
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec!["gh-org-members", "--org", "example"];
@@ -667,6 +864,152 @@ mod tests {
         );
         assert_eq!(report.source.enterprise_members, None);
         assert_eq!(report.people[0].enterprise_role, None);
+    }
+
+    fn login_check(
+        input: &str,
+        format: InputFormat,
+        keys: &[&str],
+        names: &[GivenName],
+        resolutions: &[(&str, Resolution)],
+    ) -> LoginCheckOutput {
+        let resolutions: BTreeMap<String, Resolution> = resolutions
+            .iter()
+            .map(|(given, resolution)| (given.to_string(), resolution.clone()))
+            .collect();
+        LoginCheckOutput {
+            source: LoginCheckSource {
+                input: input.to_string(),
+                api_url: "https://api.github.com/graphql".to_string(),
+                format,
+                login_keys: match format {
+                    InputFormat::Yaml => keys.iter().map(|k| k.to_string()).collect(),
+                    InputFormat::Text => Vec::new(),
+                },
+            },
+            check: logins::check(names, &resolutions),
+        }
+    }
+
+    fn given(name: &str, occurrence: &str) -> GivenName {
+        GivenName {
+            name: name.to_string(),
+            occurrences: vec![occurrence.to_string()],
+        }
+    }
+
+    fn found(login: &str) -> Resolution {
+        Resolution::Found {
+            login: login.to_string(),
+            kind: Some("User".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_login_check_says_where_the_names_came_from_and_what_to_fix() {
+        let output = login_check(
+            "config.yaml",
+            InputFormat::Yaml,
+            &["maintainers", "members"],
+            &[
+                given("RyJones", "teams[0].maintainers[0]"),
+                given("dana", "teams[0].members[0]"),
+                given("notauser", "teams[1].members[0]"),
+                given("sam@example.com", "teams[1].members[1]"),
+            ],
+            &[
+                ("RyJones", found("ryjones")),
+                ("dana", found("dana")),
+                ("notauser", Resolution::Unknown),
+            ],
+        );
+        assert_eq!(output.check.findings(), 3);
+
+        let yaml = yaml::to_string(&output).expect("serializes");
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).expect("parses");
+
+        assert_eq!(parsed["source"]["input"].as_str(), Some("config.yaml"));
+        assert_eq!(parsed["source"]["format"].as_str(), Some("yaml"));
+        assert_eq!(parsed["source"]["login_keys"][1].as_str(), Some("members"));
+        assert_eq!(parsed["totals"]["names"].as_u64(), Some(4));
+        assert_eq!(parsed["totals"]["correct"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["login_case_mismatches"][0]["given"].as_str(),
+            Some("RyJones")
+        );
+        assert_eq!(
+            parsed["login_case_mismatches"][0]["actual"].as_str(),
+            Some("ryjones")
+        );
+        assert_eq!(
+            parsed["login_case_mismatches"][0]["occurrences"][0].as_str(),
+            Some("teams[0].maintainers[0]")
+        );
+        assert_eq!(parsed["unknown"][0]["given"].as_str(), Some("notauser"));
+        // The address was never looked up, so it is invalid rather than unknown.
+        assert_eq!(
+            parsed["invalid"][0]["given"].as_str(),
+            Some("sam@example.com")
+        );
+        // A name spelled the way GitHub spells it is counted, not listed.
+        assert!(yaml.find("dana").is_none());
+    }
+
+    #[test]
+    fn a_text_input_records_no_keys_because_it_has_none() {
+        let output = login_check(
+            "logins.txt",
+            InputFormat::Text,
+            &[],
+            &[given("dana", "line 1")],
+            &[("dana", found("dana"))],
+        );
+        let yaml = yaml::to_string(&output).expect("serializes");
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).expect("parses");
+        assert_eq!(parsed["source"]["format"].as_str(), Some("text"));
+        assert!(parsed["source"].get("login_keys").is_none());
+        // Nothing to fix, so only the totals are written.
+        assert_eq!(output.check.findings(), 0);
+        assert!(parsed.get("login_case_mismatches").is_none());
+    }
+
+    #[test]
+    fn each_name_gets_a_progress_line_naming_its_outcome() {
+        assert_eq!(outcome("dana", &found("dana")), "ok");
+        assert_eq!(
+            outcome("RyJones", &found("ryjones")),
+            "wrong case: GitHub spells it ryjones"
+        );
+        assert_eq!(outcome("oldname", &found("newname")), "resolves to newname");
+        assert_eq!(outcome("nope", &Resolution::Unknown), "no such account");
+        assert_eq!(
+            outcome(
+                "hyperledger",
+                &Resolution::Found {
+                    login: "hyperledger".to_string(),
+                    kind: Some("Organization".to_string()),
+                }
+            ),
+            "ok, but that is a GitHub organization"
+        );
+    }
+
+    #[test]
+    fn checking_logins_does_not_ask_for_an_org_as_well() {
+        // The two jobs are separate: a slug passed alongside the file would be
+        // read as an export request and silently ignored.
+        assert!(Args::try_parse_from(["gh-org-members", "--check-logins", "c.yaml"]).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "gh-org-members",
+                "--check-logins",
+                "c.yaml",
+                "--org",
+                "acme"
+            ])
+            .is_err()
+        );
+        assert!(Args::try_parse_from(["gh-org-members", "--login-key", "members"]).is_err());
     }
 
     #[test]

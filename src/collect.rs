@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::client::GithubClient;
+use crate::client::{GithubClient, RateState};
+use crate::logins::Resolution;
 use crate::model::*;
 
 const ENTERPRISE_ORGS: &str = r#"
@@ -144,6 +147,127 @@ impl<'a> Collector<'a> {
     /// the product.
     fn team_batch_size(&self) -> u32 {
         self.batch_size.div_ceil(5).clamp(1, 20)
+    }
+
+    /// The rate-limit budget as of the last response, for a closing summary.
+    pub fn rate_state(&self) -> RateState {
+        self.client.rate_state()
+    }
+
+    /// Logins looked up per request. Each lookup is a single node rather than a
+    /// connection, so many fit in one query; the ceiling keeps the query text
+    /// and the alias map a readable size.
+    pub fn login_batch_size(&self) -> usize {
+        self.batch_size.clamp(1, 50) as usize
+    }
+
+    /// Ask GitHub how it spells each of these logins.
+    ///
+    /// Lookups are case-insensitive and answer with the account's own casing,
+    /// which is what makes the comparison possible. `repositoryOwner` is used
+    /// rather than `user` because it matches an organization too: an org login
+    /// in a list of people is a finding, not a missing account.
+    ///
+    /// The whole slice goes in one query. A login nothing answers to may come
+    /// back either as a null field or as an error against that field, and in the
+    /// second case GitHub may withhold the rest of the response; when that
+    /// happens the slice is halved and retried, down to single logins, so one
+    /// missing account costs a few extra requests instead of the batch.
+    ///
+    /// Returns one entry per input login, keyed by the spelling that was asked
+    /// about, in the order they were given.
+    pub async fn resolve_logins(&self, names: &[String]) -> Result<Vec<(String, Resolution)>> {
+        let mut resolved: Vec<Option<Resolution>> = vec![None; names.len()];
+        let mut pending: Vec<(usize, usize)> = if names.is_empty() {
+            Vec::new()
+        } else {
+            vec![(0, names.len())]
+        };
+
+        while let Some((start, end)) = pending.pop() {
+            match self.resolve_login_chunk(&names[start..end]).await {
+                Ok(chunk) => {
+                    for (offset, resolution) in chunk.into_iter().enumerate() {
+                        resolved[start + offset] = Some(resolution);
+                    }
+                }
+                // A single login that GitHub reports as unresolvable is the
+                // answer, not a failure; anything else is a real error and the
+                // check must not pass off an unread name as absent.
+                Err(err) if end - start == 1 => {
+                    if is_missing_owner(&err) {
+                        resolved[start] = Some(Resolution::Unknown);
+                    } else {
+                        return Err(err)
+                            .with_context(|| format!("looking up login `{}`", names[start]));
+                    }
+                }
+                Err(err) if is_missing_owner(&err) => {
+                    let middle = start + (end - start) / 2;
+                    pending.push((middle, end));
+                    pending.push((start, middle));
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("looking up {} login(s)", end - start));
+                }
+            }
+        }
+
+        Ok(names
+            .iter()
+            .cloned()
+            .zip(
+                resolved
+                    .into_iter()
+                    // Every range is either filled in or returns early above.
+                    .map(|r| r.unwrap_or(Resolution::Unknown)),
+            )
+            .collect())
+    }
+
+    /// One query for one slice of logins, in the order given.
+    async fn resolve_login_chunk(&self, names: &[String]) -> Result<Vec<Resolution>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut declarations = Vec::with_capacity(names.len());
+        let mut fields = Vec::with_capacity(names.len());
+        let mut variables = serde_json::Map::new();
+        for (index, name) in names.iter().enumerate() {
+            declarations.push(format!("$l{index}: String!"));
+            fields.push(format!(
+                "  a{index}: repositoryOwner(login: $l{index}) {{ login __typename }}"
+            ));
+            // Logins travel as variables: they come from a file, and
+            // interpolating one into the query text would let a stray quote
+            // rewrite the query.
+            variables.insert(format!("l{index}"), json!(name));
+        }
+        let query = format!(
+            "query({}) {{\n{}\n}}",
+            declarations.join(", "),
+            fields.join("\n")
+        );
+
+        let data: BTreeMap<String, Option<OwnerNode>> = self
+            .client
+            .query(&query, serde_json::Value::Object(variables))
+            .await?;
+
+        Ok((0..names.len())
+            .map(|index| {
+                match data.get(&format!("a{index}")).and_then(|o| o.as_ref()) {
+                    Some(owner) => Resolution::Found {
+                        login: owner.login.clone(),
+                        kind: owner.typename.clone(),
+                    },
+                    // Absent or null: GitHub knows no account by that name.
+                    None => Resolution::Unknown,
+                }
+            })
+            .collect())
     }
 
     /// Confirm the endpoint and token work before spending a long run on them,
@@ -468,5 +592,33 @@ fn collect_members(
                 },
             ));
         }
+    }
+}
+
+/// Whether a failed lookup says an account does not exist, as opposed to
+/// something having gone wrong. GitHub phrases the first as a `NOT_FOUND` error
+/// against the field that could not be resolved.
+fn is_missing_owner(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("not_found") || text.contains("could not resolve to")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_account_is_answered_as_unknown() {
+        let missing = anyhow::anyhow!(
+            "[NOT_FOUND] Could not resolve to a RepositoryOwner with the login of 'nope'."
+        );
+        assert!(is_missing_owner(&missing));
+
+        // Anything else has to surface: reporting an unread name as absent
+        // would turn a broken run into a clean-looking one.
+        assert!(!is_missing_owner(&anyhow::anyhow!("HTTP 502 from GitHub")));
+        assert!(!is_missing_owner(&anyhow::anyhow!(
+            "GraphQL point budget exhausted and out of retries"
+        )));
     }
 }
