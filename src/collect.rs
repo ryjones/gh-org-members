@@ -24,8 +24,8 @@ query($slug: String!, $cursor: String, $batchSize: Int!) {
     members(first: $batchSize, after: $cursor, orderBy: {field: LOGIN, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        ... on EnterpriseUserAccount { login name user { login name email } }
-        ... on User { login name email }
+        ... on EnterpriseUserAccount { login name user { login name EMAIL_FIELD } }
+        ... on User { login name EMAIL_FIELD }
       }
     }
   }
@@ -38,7 +38,7 @@ query($slug: String!, $cursor: String, $batchSize: Int!) {
     ownerInfo {
       admins(first: $batchSize, after: $cursor, orderBy: {field: LOGIN, direction: ASC}) {
         pageInfo { hasNextPage endCursor }
-        edges { role node { login name email } }
+        edges { role node { login name EMAIL_FIELD } }
       }
     }
   }
@@ -50,7 +50,7 @@ query($login: String!, $cursor: String, $batchSize: Int!) {
   organization(login: $login) {
     membersWithRole(first: $batchSize, after: $cursor) {
       pageInfo { hasNextPage endCursor }
-      edges { role node { login name email } }
+      edges { role node { login name EMAIL_FIELD } }
     }
   }
 }
@@ -66,7 +66,7 @@ query($login: String!, $cursor: String, $membership: TeamMembershipType!, $batch
         name
         members(first: $batchSize, membership: $membership) {
           pageInfo { hasNextPage endCursor }
-          edges { role node { login name email } }
+          edges { role node { login name EMAIL_FIELD } }
         }
       }
     }
@@ -80,7 +80,7 @@ query($login: String!, $team: String!, $cursor: String, $membership: TeamMembers
     team(slug: $team) {
       members(first: $batchSize, after: $cursor, membership: $membership) {
         pageInfo { hasNextPage endCursor }
-        edges { role node { login name email } }
+        edges { role node { login name EMAIL_FIELD } }
       }
     }
   }
@@ -119,6 +119,9 @@ pub struct Collector<'a> {
     membership: &'static str,
     skip_teams: bool,
     batch_size: u32,
+    /// What to put where the queries name a person's email: the field, or
+    /// nothing at all.
+    email_field: &'static str,
 }
 
 impl<'a> Collector<'a> {
@@ -127,6 +130,7 @@ impl<'a> Collector<'a> {
         include_child_team_members: bool,
         skip_teams: bool,
         batch_size: u32,
+        include_email: bool,
     ) -> Self {
         Self {
             client,
@@ -139,7 +143,16 @@ impl<'a> Collector<'a> {
             },
             skip_teams,
             batch_size: batch_size.clamp(1, 100),
+            // Asking for `email` costs a scope: a token without `read:user` or
+            // `user:email` is refused the whole query, not just that field, so
+            // a run that does not want emails must not mention them.
+            email_field: if include_email { "email" } else { "" },
         }
+    }
+
+    /// Fill in the parts of a query that depend on the run's options.
+    fn query_text(&self, template: &str) -> String {
+        template.replace("EMAIL_FIELD", self.email_field)
     }
 
     /// Teams are fetched in smaller pages than members: each team node drags a
@@ -335,7 +348,7 @@ impl<'a> Collector<'a> {
             let data: EnterpriseMembersData = self
                 .client
                 .query(
-                    ENTERPRISE_MEMBERS,
+                    &self.query_text(ENTERPRISE_MEMBERS),
                     json!({ "slug": slug, "cursor": cursor, "batchSize": self.batch_size }),
                 )
                 .await
@@ -377,7 +390,7 @@ impl<'a> Collector<'a> {
             let data: EnterpriseAdminsData = self
                 .client
                 .query(
-                    ENTERPRISE_ADMINS,
+                    &self.query_text(ENTERPRISE_ADMINS),
                     json!({ "slug": slug, "cursor": cursor, "batchSize": self.batch_size }),
                 )
                 .await
@@ -444,7 +457,7 @@ impl<'a> Collector<'a> {
             let data: OrgMembersData = self
                 .client
                 .query(
-                    ORG_MEMBERS,
+                    &self.query_text(ORG_MEMBERS),
                     json!({ "login": login, "cursor": cursor, "batchSize": self.batch_size }),
                 )
                 .await
@@ -483,7 +496,7 @@ impl<'a> Collector<'a> {
             let data: OrgTeamsData = self
                 .client
                 .query(
-                    ORG_TEAMS,
+                    &self.query_text(ORG_TEAMS),
                     json!({
                         "login": login,
                         "cursor": cursor,
@@ -518,7 +531,7 @@ impl<'a> Collector<'a> {
                     let data: TeamMembersData = self
                         .client
                         .query(
-                            TEAM_MEMBERS,
+                            &self.query_text(TEAM_MEMBERS),
                             json!({
                                 "login": login,
                                 "team": slug,

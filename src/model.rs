@@ -190,6 +190,12 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub organizations_without_team_data: Vec<String>,
     pub totals: Totals,
+    /// Anything about the run a later reader should weigh before trusting the
+    /// numbers — at present, a cluster of enterprise members in no
+    /// organization, which is what an organization the token cannot see looks
+    /// like from the inside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// People, ordered by login (case-insensitive, ascending).
     pub people: Vec<Person>,
 }
@@ -197,6 +203,14 @@ pub struct Report {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Source {
     pub api_url: String,
+    /// The account the token authenticated as. An export lists only the
+    /// organizations that account can see, so this says whose view it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_as: Option<String>,
+    /// Scopes GitHub reported for the token (`x-oauth-scopes`). Absent for
+    /// fine-grained PATs and App tokens, which do not carry them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_scopes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enterprise: Option<String>,
     /// True when team membership was expanded to include child-team members.
@@ -223,6 +237,10 @@ pub struct Totals {
     pub organizations: usize,
     pub people: usize,
     pub teams: usize,
+    /// People on the enterprise list who are in none of the organizations this
+    /// export could see. Present only when the enterprise people list was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enterprise_members_without_org: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
