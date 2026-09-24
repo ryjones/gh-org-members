@@ -6,3 +6,6 @@
 
 # Mirrored CLOWarden config repositories; nested checkouts, not tracked.
 /mirror/
+
+# Per-login reports naming real people; kept locally, not tracked.
+/reports/
