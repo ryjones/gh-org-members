@@ -52,6 +52,8 @@ With no `-o`, the YAML goes to stdout and progress goes to stderr, so
 | `--include-child-team-members` | Count members inherited from child teams as parent-team members |
 | `--no-teams` | Org membership only; skip teams entirely |
 | `--include-email` | Include each person's publicly visible email |
+| `--audit-logins <FILE>` | Write the audit-history script's login list from an export; no API calls (see below) |
+| `--audit-select <WHO>` | Which people that list names: `all` (default), `org-members-without-teams`, `enterprise-members-without-org` |
 | `--check-logins <FILE>` | Check the logins in a file instead of exporting people (see below) |
 | `--login-key <KEY>` | YAML key holding logins in that file; repeatable, replaces the default set |
 
@@ -159,6 +161,41 @@ notes:
 The note is a prompt to check, not a verdict: compare `organizations` against
 the enterprise's organization list in the web UI, and re-run with a credential
 that reaches all of them. `gh auth token` is usually that credential.
+
+## Feeding the audit-history sweep
+
+`fetch-audit-history.zsh` walks a list of logins and pulls each one's org and
+team membership history out of the enterprise audit log. Working out who is on
+that list is the expensive half of the job, and an export already answers it —
+so `--audit-logins` writes the list from a captured export, with no API calls
+and no token:
+
+```sh
+gh-org-members --audit-logins results/people.yaml -o results/audit-logins.csv
+gh-org-members --audit-logins results/people.yaml --audit-select enterprise-members-without-org
+./fetch-audit-history.zsh results/audit-logins.csv
+```
+
+```csv
+"login","name","enterprise_role","orgs","org_count","team_count"
+"alice","Alice Example","MEMBER","acme; acme-labs",2,3
+"carol","Carol Example","OWNER","",0,0
+```
+
+The login is first because that is the column the script reads; the rest is
+context for whoever opens the file. Counts describe the whole person, not the
+cohort, so someone listed for the one organization where they hold no team
+still shows the teams they hold elsewhere.
+
+`--audit-select` narrows the list to either gap cohort, using the same
+definitions as `gh-org-reports`: `org-members-without-teams` names anyone who
+holds no team in *some* organization, even if they hold one in another. A
+cohort the export cannot answer — `--no-teams` for the first, an org-only
+export for the second — is refused rather than answered with an empty list.
+
+One line per login is one login's history, and each is two queries, so a list
+of 800 is 1,600 audit-log requests; narrowing with `--audit-select` is usually
+what you want.
 
 ## Checking logins
 

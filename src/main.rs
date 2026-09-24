@@ -8,6 +8,7 @@ use clap::Parser;
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
 
+use gh_org_members::audit::{self, Cohort};
 use gh_org_members::client::GithubClient;
 use gh_org_members::collect::{Collector, EnterpriseMember, OrgSnapshot, TeamMembership};
 use gh_org_members::logins::{self, CaseCheck, InputFormat, Resolution};
@@ -64,6 +65,33 @@ struct Args {
     /// out; pagination itself is always cursor-driven.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
     batch_size: u32,
+
+    /// Write the login list `fetch-audit-history.zsh` reads, from an export
+    /// made earlier, instead of exporting people. Calls no API: the export
+    /// already says who is there. `-` reads stdin.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "enterprise",
+            "org",
+            "check_logins",
+            "no_teams",
+            "include_child_team_members",
+            "include_email",
+        ]
+    )]
+    audit_logins: Option<PathBuf>,
+
+    /// Which people `--audit-logins` names.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "all",
+        value_name = "WHO",
+        requires = "audit_logins"
+    )]
+    audit_select: Cohort,
 
     /// Check the GitHub logins in this file against the casing GitHub itself
     /// uses, instead of exporting people. `-` reads stdin.
@@ -149,8 +177,15 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode> {
     let args = Args::parse();
 
+    if let Some(path) = &args.audit_logins {
+        return write_audit_logins(&args, path);
+    }
+
     if args.check_logins.is_none() && args.enterprise.is_none() && args.org.is_empty() {
-        bail!("pass --enterprise <slug> and/or --org <slug>, or --check-logins <file>");
+        bail!(
+            "pass --enterprise <slug> and/or --org <slug>, --check-logins <file>, or \
+             --audit-logins <export>"
+        );
     }
 
     let (token, token_from) = resolve_token(args.hostname.as_deref())?;
@@ -428,6 +463,36 @@ fn input_name(path: &Path) -> String {
     } else {
         path.display().to_string()
     }
+}
+
+/// Turn an export into the login list the audit-history script reads.
+///
+/// This spends no quota and needs no token, so it runs before either is
+/// considered: re-scoping a sweep should not cost an API call, and a captured
+/// export answers "who is there" as well as a live one.
+fn write_audit_logins(args: &Args, path: &Path) -> Result<ExitCode> {
+    let text = read_input(path)?;
+    let input = input_name(path);
+    let report: Report = serde_yaml_ng::from_str(&text)
+        .with_context(|| format!("failed to read {input} as a gh-org-members export"))?;
+    if let Err(why) = args.audit_select.requires(&report) {
+        bail!("{input}: {why}");
+    }
+
+    let csv = audit::login_list(&report, args.audit_select);
+    let rows = csv.lines().count().saturating_sub(1);
+    match &args.output {
+        Some(out) => {
+            std::fs::write(out, &csv)
+                .with_context(|| format!("failed to write {}", out.display()))?;
+            eprintln!("Wrote {} ({rows} login(s) from {input})", out.display());
+        }
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(csv.as_bytes())?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Find a token: the environment first, then whatever `gh` is logged in as.
