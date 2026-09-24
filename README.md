@@ -426,6 +426,53 @@ report is unanswerable.
   them needs a token that owns the enterprise; without one they are skipped
   with a warning and the rest of the export is unaffected.
 
+## Scripts
+
+Three helpers sit beside the binaries. None of them is required to use the
+tools; each captures a job that came up often enough to be worth keeping.
+
+| Script | What it does |
+| --- | --- |
+| `fetch-audit-history.zsh` | Walks a login list and pulls each login's org and team membership history out of the enterprise audit log, as the target of an action and as the actor, into one CSV per login plus the raw JSON behind it. Needs `read:audit_log`. |
+| `mirror-clowarden.zsh` | Clones (or fetches, when already present) the CLOWarden config repositories into `mirror/<org>/<repo>`. Safe to re-run; an existing checkout is fetched rather than re-cloned. |
+| `clowarden-history.py` | Derives team membership history from the git history of those mirrored configs. No API calls. |
+
+CLOWarden applies a YAML file in each organization's governance repository, so
+that file's git history *is* the organization's membership history — and it
+reaches back further than the audit log, which serves about 180 days. In this
+enterprise the configs go back to March 2024.
+
+```sh
+gh-org-members --enterprise acme-inc -o results/people.yaml
+gh-org-members --audit-logins results/people.yaml -o results/audit-logins.csv
+./mirror-clowarden.zsh
+./clowarden-history.py --people results/people.yaml --out reports
+```
+
+`clowarden-history.py` walks every revision of every config a repository has
+ever had, diffs consecutive revisions, and writes `reports/<login>/<login>.json`
+and `.csv` — one merged, chronological history per login across every
+organization, so someone who moved from one organization to another reads as a
+move rather than as two unrelated piles of events. The JSON adds a per-org
+block with that organization's first and last event and the teams involved.
+
+Changes are `added`, `removed`, `role_changed`, or `initial` — the last meaning
+"present in the first revision of this file", which is a baseline rather than a
+join. A repository that migrated between config spellings (hyperledger-labs went
+from `access-control.yaml` to `config.yaml`) has a baseline for each, so its
+people appear as `initial` twice.
+
+Both kinds of grant a config carries are read: `teams` (maintainers and members)
+and a repository's `collaborators`. All the config spellings seen so far —
+`config.yaml`, `teams.yml`, `teams.yaml`, `access-control.yaml` — share one
+schema, and a revision that will not parse is skipped rather than guessed at.
+
+YAML is parsed by shelling out to `yq`, so no Python YAML module is needed.
+
+What these reports describe is what the config *said*, which is not always what
+GitHub shows: an export taken alongside them will disagree wherever the two have
+drifted.
+
 ## Tests
 
 ```sh
