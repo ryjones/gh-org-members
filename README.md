@@ -436,6 +436,7 @@ tools; each captures a job that came up often enough to be worth keeping.
 | `fetch-audit-history.zsh` | Walks a login list and pulls each login's org and team membership history out of the enterprise audit log, as the target of an action and as the actor, into one CSV per login plus the raw JSON behind it. Needs `read:audit_log`. |
 | `mirror-clowarden.zsh` | Clones (or fetches, when already present) the CLOWarden config repositories into `mirror/<org>/<repo>`. Safe to re-run; an existing checkout is fetched rather than re-cloned. |
 | `clowarden-history.py` | Derives team membership history from the git history of those mirrored configs. No API calls. |
+| `clowarden-drift.py` | Reconciles the current configs against an export and reports every disagreement. No API calls. |
 
 CLOWarden applies a YAML file in each organization's governance repository, so
 that file's git history *is* the organization's membership history — and it
@@ -470,8 +471,22 @@ schema, and a revision that will not parse is skipped rather than guessed at.
 YAML is parsed by shelling out to `yq`, so no Python YAML module is needed.
 
 What these reports describe is what the config *said*, which is not always what
-GitHub shows: an export taken alongside them will disagree wherever the two have
-drifted.
+GitHub shows. `clowarden-drift.py` names the disagreements:
+
+```sh
+./clowarden-drift.py --people results/people.yaml --out reports
+```
+
+It writes `reports/drift.csv` and `reports/drift.json`, one record per
+disagreement, in four kinds: `on_github_not_in_config` (access nobody declared),
+`in_config_not_on_github` (declared, never applied), `role_mismatch`, and
+`team_not_in_config` (the team itself is unmanaged). Only organizations that
+have a config are compared — elsewhere there is no intent to disagree with — and
+team names are matched as GitHub slugs.
+
+A config declares teams and repositories, not organization membership, so
+someone in an organization and on no team cannot drift by this measure. That
+question belongs to `gh-org-reports`.
 
 ## Tests
 
