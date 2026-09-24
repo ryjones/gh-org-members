@@ -19,6 +19,7 @@ import concurrent.futures
 import csv
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -29,28 +30,43 @@ def run(args, **kwargs):
     return subprocess.run(args, capture_output=True, text=True, **kwargs)
 
 
+CONFIG_RE = re.compile(r"^(config|teams|access-control)\.ya?ml$", re.I)
+
+
 def config_repos(mirror):
-    """Every mirrored checkout, with the config file it carries."""
+    """Every mirrored checkout, with every config path in its history.
+
+    A repo that migrated -- hyperledger-labs went from access-control.yaml to
+    config.yaml in 2024 -- has history under both names, and following only the
+    current one loses everything before the move.
+    """
     for git_dir in sorted(mirror.glob("*/*/.git")):
         repo = git_dir.parent
-        for name in CONFIG_NAMES:
-            if (repo / name).exists():
-                yield repo, name
-                break
+        seen = run(["git", "-C", str(repo), "log", "--all", "--name-only",
+                    "--format="]).stdout.splitlines()
+        paths = sorted({line.strip() for line in seen if CONFIG_RE.match(line.strip())})
+        for path in paths:
+            yield repo, path
 
 
 def revisions(repo, config):
-    """(sha, iso date, author, path) oldest first, following renames."""
-    out = run(["git", "-C", str(repo), "log", "--follow", "--reverse",
-               "--format=@@@%H\t%aI\t%an", "--name-only", "--", config]).stdout
-    revs, current = [], None
+    """(sha, iso date, author, path) oldest first, for one config path.
+
+    Deliberately no `--follow`: it does not compose with `--reverse` (git
+    quietly returns a couple of commits instead of the file's history), and it
+    is not needed here because every config path a repo has ever had is walked
+    separately, so a rename is covered by both names rather than by git
+    guessing at one.
+    """
+    out = run(["git", "-C", str(repo), "log", "--format=%H\t%aI\t%an",
+               "--", config]).stdout
+    revs = []
     for line in out.splitlines():
-        if line.startswith("@@@"):
-            sha, date, author = line[3:].split("\t", 2)
-            current = [sha, date, author]
-        elif line.strip() and current:
-            revs.append((*current, line.strip()))
-            current = None
+        if not line.strip():
+            continue
+        sha, date, author = line.split("\t", 2)
+        revs.append((sha, date, author, config))
+    revs.reverse()  # oldest first, so each revision diffs against the one before
     return revs
 
 
@@ -74,7 +90,25 @@ def snapshot(repo, sha, path, cache):
         return None
 
     members = {}
-    teams = (data or {}).get("teams") or []
+    data = data or {}
+
+    # Per-repository external collaborators: a list of logins, or a map of
+    # login to permission.
+    for entry in data.get("repositories") or []:
+        if not isinstance(entry, dict):
+            continue
+        repo_name = entry.get("name")
+        collaborators = entry.get("collaborators")
+        if not repo_name or not collaborators:
+            continue
+        pairs = (collaborators.items() if isinstance(collaborators, dict)
+                 else [(login, "COLLABORATOR") for login in collaborators])
+        for login, permission in pairs:
+            if isinstance(login, str) and login.strip():
+                members[("collaborator", str(repo_name), login.strip().lower())] = (
+                    str(permission).upper(), login.strip())
+
+    teams = data.get("teams") or []
     if isinstance(teams, dict):  # some configs key teams by name
         teams = [{"name": name, **(body or {})} for name, body in teams.items()]
     for team in teams:
@@ -86,7 +120,7 @@ def snapshot(repo, sha, path, cache):
         for role, key in (("MAINTAINER", "maintainers"), ("MEMBER", "members")):
             for login in team.get(key) or []:
                 if isinstance(login, str) and login.strip():
-                    members[(str(name), login.strip().lower())] = (role, login.strip())
+                    members[("team", str(name), login.strip().lower())] = (role, login.strip())
     cache[blob] = members
     return members
 
@@ -94,6 +128,12 @@ def snapshot(repo, sha, path, cache):
 def repo_events(repo, config, quiet=False):
     """Every add, removal and role change the config's history describes."""
     org, name = repo.parent.name, repo.name
+
+    def event(date, key, change, role, previous_role, login, sha, author):
+        kind, target = key[0], key[1]
+        return dict(timestamp=date, org=org, repo=name, kind=kind, target=target,
+                    login=login, change=change, role=role, previous_role=previous_role,
+                    commit=sha[:12], author=author, source_file=config)
     events, previous, cache = [], None, {}
     revs = revisions(repo, config)
     for sha, date, author, path in revs:
@@ -103,25 +143,18 @@ def repo_events(repo, config, quiet=False):
         if previous is not None:
             for key, (role, login) in current.items():
                 if key not in previous:
-                    events.append(dict(timestamp=date, org=org, repo=name, team=key[0],
-                                       login=login, change="added", role=role,
-                                       previous_role="", commit=sha[:12], author=author))
+                    events.append(event(date, key, "added", role, "", login, sha, author))
                 elif previous[key][0] != role:
-                    events.append(dict(timestamp=date, org=org, repo=name, team=key[0],
-                                       login=login, change="role_changed", role=role,
-                                       previous_role=previous[key][0], commit=sha[:12],
-                                       author=author))
+                    events.append(event(date, key, "role_changed", role,
+                                        previous[key][0], login, sha, author))
             for key, (role, login) in previous.items():
                 if key not in current:
-                    events.append(dict(timestamp=date, org=org, repo=name, team=key[0],
-                                       login=login, change="removed", role="",
-                                       previous_role=role, commit=sha[:12], author=author))
+                    events.append(event(date, key, "removed", "", role, login, sha, author))
         else:
-            # The first revision is the baseline: everyone in it starts there.
-            for (team, _), (role, login) in current.items():
-                events.append(dict(timestamp=date, org=org, repo=name, team=team,
-                                   login=login, change="initial", role=role,
-                                   previous_role="", commit=sha[:12], author=author))
+            # The first revision of this file is a baseline, not a join: a repo
+            # that migrated config files starts its new file with everyone in it.
+            for key, (role, login) in current.items():
+                events.append(event(date, key, "initial", role, "", login, sha, author))
         previous = current
     if not quiet:
         print(f"{org}/{name} -- {len(revs)} revision(s) of {config}, {len(events)} event(s)",
@@ -141,11 +174,12 @@ def export_logins(path):
             for p in data.get("people") or []]
 
 
-FIELDS = ["timestamp", "org", "repo", "team", "change", "role", "previous_role",
-          "commit", "author"]
+FIELDS = ["timestamp", "org", "repo", "kind", "target", "change", "role",
+          "previous_role", "commit", "author", "source_file"]
 
 
 def write_reports(people, by_login, out, source):
+    """One report per login, merged across every org's config."""
     out.mkdir(parents=True, exist_ok=True)
     with_history = 0
     for login, name, current_teams in people:
@@ -161,19 +195,44 @@ def write_reports(people, by_login, out, source):
             writer.writeheader()
             writer.writerows(events)
 
-        teams = sorted({f"{e['org']}/{e['team']}" for e in events})
+        teams = sorted({f"{e['org']}/{e['target']}" for e in events if e["kind"] == "team"})
+        repos = sorted({f"{e['org']}/{e['target']}" for e in events
+                        if e["kind"] == "collaborator"})
+
+        # One block per org, so a login that moved from one org to another reads
+        # as a move rather than as two unrelated piles of events.
+        orgs = {}
+        for e in events:
+            block = orgs.setdefault(e["org"], {
+                "first_event": e["timestamp"], "last_event": e["timestamp"],
+                "events": 0, "teams": set(),
+            })
+            block["events"] += 1
+            block["last_event"] = e["timestamp"]
+            if e["kind"] == "team":
+                block["teams"].add(e["target"])
+        timeline = [
+            {"org": org, **{k: v for k, v in block.items() if k != "teams"},
+             "teams": sorted(block["teams"])}
+            for org, block in sorted(orgs.items(), key=lambda kv: kv[1]["first_event"])
+        ]
+
         (folder / f"{login}.json").write_text(json.dumps({
             "login": login,
             "name": name,
             "source": source,
             "totals": {
                 "events": len(events),
+                "organizations": len(orgs),
                 "teams_seen": len(teams),
+                "repositories_as_collaborator": len(repos),
                 "first_event": events[0]["timestamp"] if events else None,
                 "last_event": events[-1]["timestamp"] if events else None,
             },
+            "organizations": timeline,
             "teams_now": current_teams,
             "teams_seen": teams,
+            "repositories_as_collaborator": repos,
             "events": events,
         }, indent=2) + "\n")
     return with_history
@@ -205,6 +264,13 @@ def main():
         by_login[event["login"].lower()].append(event)
 
     people = export_logins(args.people)
+    # Everyone the configs ever named gets a report, not only the people an
+    # export happens to hold now: a login that left is exactly the history
+    # worth keeping.
+    known = {login.lower() for login, _, _ in people}
+    for login in sorted(by_login):
+        if login not in known:
+            people.append((by_login[login][0]["login"], "", []))
     source = {
         "mirror": str(args.mirror),
         "people": str(args.people),
@@ -213,13 +279,10 @@ def main():
     }
     with_history = write_reports(people, by_login, args.out, source)
 
-    outside = sorted(set(by_login) - {login.lower() for login, _, _ in people})
     print(f"\n{len(events)} event(s) across {len(by_login)} login(s)")
     print(f"wrote {len(people)} report(s) to {args.out}/<login>/, "
           f"{with_history} with history")
-    if outside:
-        print(f"{len(outside)} login(s) appear in config history but not in the export "
-              f"(left without a report)")
+    print(f"{len(people) - len(known)} of them are logins the export no longer holds")
 
 
 if __name__ == "__main__":
