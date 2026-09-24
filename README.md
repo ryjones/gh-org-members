@@ -55,13 +55,21 @@ With no `-o`, the YAML goes to stdout and progress goes to stderr, so
 | `--check-logins <FILE>` | Check the logins in a file instead of exporting people (see below) |
 | `--login-key <KEY>` | YAML key holding logins in that file; repeatable, replaces the default set |
 
-The token is read from `GITHUB_TOKEN`, falling back to `GH_TOKEN`.
+The token is read from `GITHUB_TOKEN`, falling back to `GH_TOKEN`, and then to
+`gh auth token` if the `gh` CLI is logged in. The CLI's own credential is worth
+preferring: it carries the SSO authorizations and organization grants that a
+hand-made PAT has to be given one organization at a time, and an export made
+with a token that cannot see an organization leaves that organization out
+without saying so (see **Whose view an export is**). The startup line names
+which of the three the run used.
 
 ## Output
 
 ```yaml
 source:
   api_url: https://api.github.com/graphql
+  authenticated_as: alice
+  token_scopes: read:org, repo
   enterprise: acme-inc
   include_child_team_members: false
   teams: true
@@ -73,6 +81,7 @@ totals:
   organizations: 2
   people: 87
   teams: 31
+  enterprise_members_without_org: 1
 people:
   - login: alice
     name: Alice Example
@@ -107,6 +116,15 @@ the team level. `enterprise_role` is `OWNER` or `MEMBER`, and is present only
 with `--enterprise`. `email` is only present with `--include-email`, and only
 when the account exposes one publicly.
 
+`authenticated_as` and `token_scopes` say whose view the export is. An export
+lists only the organizations its token can see, so the same enterprise read with
+two credentials can yield two different org lists; `token_scopes` is absent for
+fine-grained PATs and App tokens, which do not report scopes at all.
+
+`enterprise_members_without_org` counts the people on the enterprise list who
+are in none of the organizations listed, and appears only when that list was
+read. See **Whose view an export is** for why it is worth a second look.
+
 The two `source` flags exist so a later reader can tell an empty list from an
 unasked question: `teams: false` means the run passed `--no-teams`, and
 `enterprise_members` is present only when the enterprise's own people list was
@@ -115,6 +133,32 @@ read.
 If teams could not be read for some organization — a token without `read:org`
 there — that org is listed under `organizations_without_team_data` and its
 people appear with no team membership, rather than silently looking team-less.
+
+## Whose view an export is
+
+An organization the token cannot see is not an error. `enterprise.organizations`
+simply does not return it, the export lists the organizations that came back,
+and nothing in the file says one is missing. Its members are still on the
+enterprise people list, so they land in the export as people who belong to the
+enterprise and to no organization at all.
+
+That is the tell. A genuinely unaffiliated account or two is ordinary; a cluster
+of them usually means an organization went unseen. When they are at least five
+people and at least 2% of the export, the run prints a warning and records it
+under `notes`:
+
+```yaml
+notes:
+  - "enterprise_members_without_org: 32 of 800 people (4.0%) are in the enterprise
+    but in none of the organizations listed here. An organization the token cannot
+    see is omitted from the enterprise listing without an error, and its members
+    look exactly like this; check `organizations` against the enterprise's own
+    list before reading them as unaffiliated."
+```
+
+The note is a prompt to check, not a verdict: compare `organizations` against
+the enterprise's organization list in the web UI, and re-run with a credential
+that reaches all of them. `gh auth token` is usually that credential.
 
 ## Checking logins
 
@@ -316,6 +360,11 @@ report is unanswerable.
 - **Team membership is direct by default.** `--include-child-team-members`
   switches to GitHub's `ALL` semantics, where a parent team also reports the
   members of its child teams.
+- **`email` costs a scope, so it is asked for only when wanted.** The `email`
+  field needs `read:user` or `user:email`, and GitHub refuses the *entire*
+  query when the token lacks them rather than omitting that one field. The
+  queries therefore name `email` only under `--include-email`, so an ordinary
+  export works with a `read:org` token.
 - **Rate limits.** The client tracks the `x-ratelimit-*` headers and waits for
   the reset before spending the last of the budget, honors `Retry-After`,
   recognizes secondary rate limits and `RATE_LIMITED` responses on an otherwise

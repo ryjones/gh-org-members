@@ -228,6 +228,8 @@ mod tests {
                 include_child_team_members: false,
                 teams,
                 enterprise_members,
+                authenticated_as: None,
+                token_scopes: None,
             },
             organizations: vec!["acme".to_string()],
             organizations_without_team_data: Vec::new(),
@@ -235,7 +237,9 @@ mod tests {
                 organizations: 1,
                 people: 2,
                 teams: 1,
+                enterprise_members_without_org: None,
             },
+            notes: Vec::new(),
             people: vec![
                 Person {
                     login: "sam".to_string(),

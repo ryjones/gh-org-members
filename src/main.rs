@@ -153,12 +153,7 @@ async fn run() -> Result<ExitCode> {
         bail!("pass --enterprise <slug> and/or --org <slug>, or --check-logins <file>");
     }
 
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .map_err(|_| anyhow::anyhow!("set GITHUB_TOKEN (or GH_TOKEN) to a token with read:org"))?;
-    if token.trim().is_empty() {
-        bail!("GITHUB_TOKEN is set but empty");
-    }
+    let (token, token_from) = resolve_token(args.hostname.as_deref())?;
 
     let api_url = match (&args.api_url, &args.hostname) {
         (Some(url), _) => url.clone(),
@@ -179,10 +174,11 @@ async fn run() -> Result<ExitCode> {
         args.include_child_team_members,
         args.no_teams,
         args.batch_size,
+        args.include_email,
     );
 
     let viewer = collector.viewer_login().await?;
-    eprintln!("Authenticated as {viewer} at {api_url}");
+    eprintln!("Authenticated as {viewer} at {api_url} (token from {token_from})");
 
     if let Some(path) = &args.check_logins {
         return check_logins(&args, &api_url, &collector, path).await;
@@ -259,7 +255,12 @@ async fn run() -> Result<ExitCode> {
         bail!("every organization failed to query");
     }
 
-    let report = build_report(&args, &api_url, succeeded, enterprise);
+    let mut report = build_report(&args, &api_url, succeeded, enterprise);
+    report.source.authenticated_as = Some(viewer.clone());
+    report.source.token_scopes = client.oauth_scopes();
+    for note in &report.notes {
+        eprintln!("Warning: {note}");
+    }
 
     let yaml = yaml::to_string(&report).context("failed to serialize YAML")?;
     match &args.output {
@@ -429,6 +430,82 @@ fn input_name(path: &Path) -> String {
     }
 }
 
+/// Find a token: the environment first, then whatever `gh` is logged in as.
+///
+/// The environment wins because it is the explicit choice, but falling back to
+/// the CLI matters more than it looks: `gh`'s own credential already carries
+/// the SSO authorizations and org grants a hand-made PAT has to be given one at
+/// a time, and an export made with a token that cannot see an organization
+/// omits that organization silently.
+fn resolve_token(hostname: Option<&str>) -> Result<(String, String)> {
+    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => {
+                return Ok((value.trim().to_string(), name.to_string()));
+            }
+            Ok(_) => bail!("{name} is set but empty"),
+            Err(_) => {}
+        }
+    }
+
+    let mut command = std::process::Command::new("gh");
+    command.arg("auth").arg("token");
+    if let Some(host) = hostname {
+        let host = host
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        command.arg("--hostname").arg(host);
+    }
+    let output = command.output().map_err(|err| {
+        anyhow::anyhow!(
+            "set GITHUB_TOKEN (or GH_TOKEN) to a token with read:org, \
+             or log in with `gh auth login` (could not run gh: {err})"
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "set GITHUB_TOKEN (or GH_TOKEN) to a token with read:org, or log in \
+             with `gh auth login` (gh auth token failed: {})",
+            stderr.trim()
+        );
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        bail!("`gh auth token` returned nothing; run `gh auth login`");
+    }
+    Ok((token, "gh auth token".to_string()))
+}
+
+/// Say so when a suspicious share of the enterprise appears to be in no
+/// organization at all.
+///
+/// An organization the token cannot see is left out of the enterprise listing
+/// with no error, and its members then surface as enterprise members who belong
+/// to nothing — so a cluster of them is a symptom of a missing organization
+/// rather than a roster of idle accounts. The floor keeps a genuinely
+/// unaffiliated person or two from raising it.
+fn visibility_note(org_less: usize, people: usize) -> Option<String> {
+    const MIN_PEOPLE: usize = 5;
+    const MIN_PERCENT: f64 = 2.0;
+
+    if people == 0 || org_less < MIN_PEOPLE {
+        return None;
+    }
+    let percent = org_less as f64 * 100.0 / people as f64;
+    if percent < MIN_PERCENT {
+        return None;
+    }
+    Some(format!(
+        "enterprise_members_without_org: {org_less} of {people} people ({percent:.1}%) are in \
+         the enterprise but in none of the organizations listed here. An organization the \
+         token cannot see is omitted from the enterprise listing without an error, and its \
+         members look exactly like this; check `organizations` against the enterprise's own \
+         list before reading them as unaffiliated."
+    ))
+}
+
 fn build_report(
     args: &Args,
     api_url: &str,
@@ -473,6 +550,8 @@ fn build_report(
         }
     }
 
+    let enterprise_read = enterprise.read == Some(true);
+
     // Last, so that someone on the enterprise list who is in no organization
     // still gets an entry — with `organizations: []`, which is exactly what the
     // "in the enterprise, in no org" report looks for.
@@ -509,9 +588,24 @@ fn build_report(
         })
         .collect();
 
+    // Only meaningful when the enterprise's own people list was read: without
+    // it nobody could appear outside an org, so a zero would be an artifact.
+    let org_less = enterprise_read.then(|| {
+        people
+            .iter()
+            .filter(|person| person.organizations.is_empty())
+            .count()
+    });
+    let notes = org_less
+        .and_then(|count| visibility_note(count, people.len()))
+        .into_iter()
+        .collect();
+
     Report {
         source: Source {
             api_url: api_url.to_string(),
+            authenticated_as: None,
+            token_scopes: None,
             enterprise: args.enterprise.clone(),
             include_child_team_members: args.include_child_team_members,
             teams: !args.no_teams,
@@ -523,7 +617,9 @@ fn build_report(
             organizations: org_logins.len(),
             people: people.len(),
             teams: team_total,
+            enterprise_members_without_org: org_less,
         },
+        notes,
         people,
     }
 }
@@ -606,6 +702,58 @@ mod tests {
             team_count,
             teams_readable: true,
         }
+    }
+
+    #[test]
+    fn a_lone_unaffiliated_person_raises_no_note() {
+        assert_eq!(visibility_note(0, 800), None);
+        assert_eq!(visibility_note(1, 800), None);
+        // Four in a small enterprise is a large share, but too few to mean much.
+        assert_eq!(visibility_note(4, 20), None);
+    }
+
+    #[test]
+    fn a_share_of_the_enterprise_in_no_org_raises_a_note() {
+        // The shape of the LFDT-Lineth incident: 32 of 800, an org the token
+        // could not see. A 5% floor would have let this pass, so the bar is 2%.
+        let note = visibility_note(32, 800).expect("32 of 800 should be noted");
+        assert!(note.starts_with("enterprise_members_without_org: 32 of 800 people (4.0%)"));
+        assert!(note.contains("token cannot see"));
+        // Just under the floor, and just over it.
+        assert_eq!(visibility_note(15, 1000), None);
+        assert!(visibility_note(20, 1000).is_some());
+    }
+
+    #[test]
+    fn org_less_members_are_counted_only_when_the_enterprise_list_was_read() {
+        let snapshots = vec![snapshot(
+            "acme",
+            vec![(actor("sam"), Some("MEMBER".into()))],
+            vec![],
+        )];
+        let report = build_report(
+            &args(&["--enterprise", "acme-inc"]),
+            "https://api.github.com/graphql",
+            snapshots,
+            enterprise(vec![("sam", "MEMBER"), ("carol", "MEMBER")]),
+        );
+        // carol is on the enterprise list and in no org; sam is in one.
+        assert_eq!(report.totals.enterprise_members_without_org, Some(1));
+        // One person is under the floor, so nothing is claimed about it.
+        assert!(report.notes.is_empty());
+
+        let snapshots = vec![snapshot(
+            "acme",
+            vec![(actor("sam"), Some("MEMBER".into()))],
+            vec![],
+        )];
+        let unread = build_report(
+            &args(&[]),
+            "https://api.github.com/graphql",
+            snapshots,
+            EnterpriseInput::default(),
+        );
+        assert_eq!(unread.totals.enterprise_members_without_org, None);
     }
 
     #[test]

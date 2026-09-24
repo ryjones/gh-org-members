@@ -24,6 +24,7 @@ pub struct GithubClient {
     endpoint: String,
     max_retries: u32,
     state: Mutex<RateState>,
+    oauth_scopes: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -98,11 +99,24 @@ impl GithubClient {
             endpoint: api_url.to_string(),
             max_retries,
             state: Mutex::new(RateState::default()),
+            oauth_scopes: Mutex::new(None),
         })
     }
 
     pub fn rate_state(&self) -> RateState {
         *self.state.lock().expect("rate state mutex poisoned")
+    }
+
+    /// The scopes GitHub reported for the token, from the most recent response.
+    ///
+    /// Classic PATs and OAuth tokens carry `x-oauth-scopes`; fine-grained PATs
+    /// and App installation tokens send nothing, so `None` means "not a scoped
+    /// token" rather than "no permissions".
+    pub fn oauth_scopes(&self) -> Option<String> {
+        self.oauth_scopes
+            .lock()
+            .expect("scope mutex poisoned")
+            .clone()
     }
 
     /// Run a query and deserialize the `data` object into `T`.
@@ -262,6 +276,14 @@ impl GithubClient {
     }
 
     fn record_headers(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(scopes) = headers
+            .get("x-oauth-scopes")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|scopes| !scopes.is_empty())
+        {
+            *self.oauth_scopes.lock().expect("scope mutex poisoned") = Some(scopes.to_string());
+        }
         let limit = header_u64(headers, "x-ratelimit-limit").map(|v| v as u32);
         let remaining = header_u64(headers, "x-ratelimit-remaining").map(|v| v as u32);
         let reset = header_u64(headers, "x-ratelimit-reset");

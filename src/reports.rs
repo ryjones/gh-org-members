@@ -168,6 +168,8 @@ mod tests {
                 include_child_team_members: false,
                 teams: true,
                 enterprise_members: Some(true),
+                authenticated_as: None,
+                token_scopes: None,
             },
             organizations: vec!["acme".to_string(), "acme-labs".to_string()],
             organizations_without_team_data: Vec::new(),
@@ -175,7 +177,9 @@ mod tests {
                 organizations: 2,
                 people: people.len(),
                 teams: 0,
+                enterprise_members_without_org: None,
             },
+            notes: Vec::new(),
             people,
         }
     }
