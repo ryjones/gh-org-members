@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod client;
 pub mod collect;
 pub mod logins;
