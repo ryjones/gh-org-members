@@ -3,3 +3,6 @@
 
 # Captured API output from real runs; kept locally, not tracked.
 /results
+
+# Mirrored CLOWarden config repositories; nested checkouts, not tracked.
+/mirror/
