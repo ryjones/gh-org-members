@@ -1,3 +1,5 @@
+See [github-audit-tools](https://github.com/ryjones/github-audit-tools) which replaces this
+
 # gh-org-members
 
 Queries a GitHub enterprise or organization over GraphQL and emits a YAML file
